@@ -1,0 +1,62 @@
+================================================================================
+ HOMEWORK #6  -  STEP 5: SKEW JOIN (AQESkewedJoin)
+ Query: SELECT date, sum(quantity * price) FROM sales s JOIN items i
+        ON s.item_id = i.id GROUP BY 1 ORDER BY 2 DESC     (NO filter)
+ Data : sales = 20,000,000 rows | 80% skew on item_id = 100
+        items =    600,000 rows
+================================================================================
+
+ AQE ENABLED = TRUE                                   Execution Time: 29.8335 s
+--------------------------------------------------------------------------------
+ INITIAL PLAN (isFinalPlan=false)
+   SortMergeJoin [cast(item_id as bigint)], [id], Inner
+
+ FINAL PLAN (isFinalPlan=true)
+   SortMergeJoin(skew=true) ...                                      <<< SKEW
+     +- AQEShuffleRead coalesced and skewed                 <<< hot part. SPLIT
+     +- AQEShuffleRead coalesced
+
+ AQE ENABLED = FALSE                                  Execution Time: 80.1008 s
+--------------------------------------------------------------------------------
+   SortMergeJoin [cast(item_id as bigint)], [id], Inner
+   Plan identical before and after execution - no re-planning.
+   No AdaptiveSparkPlan wrapper. No AQEShuffleRead. No skew handling.
+
+================================================================================
+ RESULT   AQE ON 29.8335 s | AQE OFF 80.1008 s | Speedup 2.68x (50.27 s saved)
+================================================================================
+
+ WHY
+   item_id is the join key, so hash partitioning sends all 16,000,000 rows
+   with item_id = 100 into ONE of the 200 shuffle partitions. The other 199
+   share the remaining ~4,000,000 rows (~20,000 each) - about 800x less work.
+
+   AQE OFF : one task processes 16M rows while 199 peers finish immediately
+             and their cores idle. The stage waits on the straggler.
+   AQE ON  : after the shuffle map stage Spark reads the real partition sizes,
+             detects the oversized one, splits it into ~16MB pieces, and
+             duplicates the matching items partition to each piece so every
+             split joins independently.  (Lecture slide 67)
+
+   Skew does not create more work - it removes parallelism.
+   AQE does not reduce the work either; it redistributes it.
+
+ CONFIGURATION NOTE
+   Default skewedPartitionThresholdInBytes = 256MB did NOT trigger detection
+   (first run: 37.86 s ON / 81.10 s OFF, only "AQEShuffleRead coalesced").
+   The hot partition was ~800x the median but below the 256MB absolute floor.
+
+     .config("spark.sql.adaptive.skewJoin.enabled", "true")
+     .config("spark.sql.adaptive.skewJoin.skewedPartitionThresholdInBytes", "16MB")
+     .config("spark.sql.adaptive.advisoryPartitionSizeInBytes", "16MB")
+     .config("spark.sql.autoBroadcastJoinThreshold", "1MB")
+
+   The 1MB broadcast threshold is required: at 600,000 rows items is only
+   3.05MB, below the 10MB default, so Spark would broadcast it - and a
+   broadcast join does not shuffle the large side, so there would be no
+   skewed partition to detect at all.
+
+ NOTE ON TIMING
+   The AQE ON run executed FIRST on a cold JVM and cold page cache; AQE OFF
+   ran second with both warm. The measured speedup is conservative.
+================================================================================

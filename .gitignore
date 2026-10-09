@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Spark local demo artifacts (week7)
+spark-warehouse/
+metastore_db/
+derby.log
